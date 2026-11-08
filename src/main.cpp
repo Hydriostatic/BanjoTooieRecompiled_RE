@@ -646,6 +646,30 @@ int main(int argc, char** argv) {
     recompui::register_launcher_init_callback(initialize_launcher_menu);
     std::fprintf(stderr, "[tooie] step ui_exports\n"); std::fflush(stderr);
 
+    // RT64 texture packs. Any mod containing an rt64.json (a standalone .rtz,
+    // or an .nrm that bundles textures) is handed to the renderer when it is
+    // enabled. Without this, installed texture packs are listed in the mod
+    // menu but never applied.
+    {
+        recomp::mods::ModContentType texture_pack_content_type{
+            .content_filename = "rt64.json",
+            .allow_runtime_toggle = true,
+            .on_enabled = [](recomp::mods::ModContext& context, const recomp::mods::ModHandle& mod) {
+                recompui::renderer::enable_texture_pack(context, mod);
+            },
+            .on_disabled = [](recomp::mods::ModContext&, const recomp::mods::ModHandle& mod) {
+                recompui::renderer::disable_texture_pack(mod);
+            },
+            .on_reordered = [](recomp::mods::ModContext&) {
+                recompui::renderer::trigger_texture_pack_update();
+            },
+        };
+        const recomp::mods::ModContentTypeId texture_pack_content_type_id =
+            recomp::mods::register_mod_content_type(texture_pack_content_type);
+        recomp::mods::register_mod_container_type("rtz", { texture_pack_content_type_id }, false);
+    }
+    std::fprintf(stderr, "[tooie] step texture_packs\n"); std::fflush(stderr);
+
     tooie::register_overlays();
     std::fprintf(stderr, "[tooie] step overlays\n"); std::fflush(stderr);
 
