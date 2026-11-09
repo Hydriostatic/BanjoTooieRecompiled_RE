@@ -1157,10 +1157,47 @@ bool append_matrix_group(uint8_t* rdram, uint32_t cursor, uint32_t transform_id,
     return true;
 }
 
+
+int32_t read_half_signed(uint8_t* rdram, uint32_t address) {
+    return static_cast<int32_t>(
+        MEM_H(0, static_cast<gpr>(static_cast<int32_t>(address))));
+}
+
 struct RootScope {
     uint32_t transform_id;
     bool pushed;
 };
+
+// ---- Every other model (enemies, NPCs, objects) --------------------------
+//
+// The player and the sky get stable ids above; everything else drawn through
+// the shared model renderer used to be left to RT64's matching heuristic. For
+// an animated actor that heuristic pairs *bone* matrices between frames by draw
+// hash and matrix difference, and when two bones of the same mesh look alike it
+// blends the wrong ones, which shows up above the game's own frame rate as
+// brief spikes and shards around moving characters.
+//
+// Each draw of a model is given the id of the previous frame's draw of the
+// same model whose root translation is nearest (greedy, one claim per draw),
+// or a fresh id if none is close. Its bones then get root id + 1 + bone index,
+// exactly like the player's, so RT64 pairs every bone with itself.
+struct ActorInstance {
+    uint32_t model;
+    int32_t x, y, z;
+    bool has_pos;
+    bool claimed;
+    uint32_t id;
+};
+constexpr uint32_t kActorInstanceMax = 512U;
+constexpr uint32_t kActorTransformIdBase = 0x20000000U;
+constexpr uint32_t kActorTransformIdStride = 0x100U;
+constexpr uint32_t kActorIdCount = 0xDFFFFU;
+constexpr int64_t kActorMatchDistanceSq = 1000LL * 1000LL;
+thread_local ActorInstance g_actor_prev[kActorInstanceMax] = {};
+thread_local ActorInstance g_actor_cur[kActorInstanceMax] = {};
+thread_local uint32_t g_actor_prev_count = 0;
+thread_local uint32_t g_actor_cur_count = 0;
+thread_local uint32_t g_actor_next_id = 0;
 
 struct PlayerModelKey {
     uint32_t player;
@@ -1323,6 +1360,85 @@ void note_append_failure(uint32_t site) {
     g_frame_failure_mask |= (1U << site);
 }
 
+// BT_RT64_ACTORS=off: leave non-player models to RT64's heuristic, as before.
+bool rt64_actors_off() {
+    static const bool off = rt64_env_off("BT_RT64_ACTORS");
+    return off;
+}
+
+void actor_begin_frame() {
+    for (uint32_t i = 0; i < g_actor_cur_count; ++i) {
+        g_actor_prev[i] = g_actor_cur[i];
+        g_actor_prev[i].claimed = false;
+    }
+    g_actor_prev_count = g_actor_cur_count;
+    g_actor_cur_count = 0;
+}
+
+// The root gSPMatrix is one of the last few commands before the cursor. Its
+// integer translation (row 3 of the N64 fixed-point matrix) is enough to tell
+// instances of the same model apart.
+bool root_translation(uint8_t* rdram, uint32_t cursor, int32_t* out) {
+    const uint32_t gfx = read_word(rdram, cursor);
+    for (uint32_t back = 1; back <= 6; ++back) {
+        const uint32_t cmd = gfx - back * 8U;
+        if (!in_rdram(cmd, 8U)) {
+            return false;
+        }
+        if ((read_word(rdram, cmd) >> 24) == 0xDAU) {
+            const uint32_t mtx = read_word(rdram, cmd + 4U);
+            if (!in_rdram(mtx, 64U)) {
+                return false;
+            }
+            out[0] = read_half_signed(rdram, mtx + 24U);
+            out[1] = read_half_signed(rdram, mtx + 26U);
+            out[2] = read_half_signed(rdram, mtx + 28U);
+            return true;
+        }
+    }
+    return false;
+}
+
+uint32_t actor_transform_id(uint8_t* rdram, uint32_t cursor, uint32_t model) {
+    if (g_actor_cur_count >= kActorInstanceMax) {
+        return 0;
+    }
+    ActorInstance inst = {};
+    inst.model = model;
+    int32_t p[3] = {0, 0, 0};
+    inst.has_pos = root_translation(rdram, cursor, p);
+    inst.x = p[0]; inst.y = p[1]; inst.z = p[2];
+
+    int32_t best = -1;
+    int64_t best_d = kActorMatchDistanceSq;
+    for (uint32_t i = 0; i < g_actor_prev_count; ++i) {
+        const ActorInstance& prev = g_actor_prev[i];
+        if (prev.claimed || prev.model != model || prev.has_pos != inst.has_pos) {
+            continue;
+        }
+        if (!inst.has_pos) {            // no position: first unclaimed, in order
+            best = static_cast<int32_t>(i);
+            break;
+        }
+        const int64_t dx = prev.x - inst.x, dy = prev.y - inst.y, dz = prev.z - inst.z;
+        const int64_t d = dx * dx + dy * dy + dz * dz;
+        if (d < best_d) {
+            best_d = d;
+            best = static_cast<int32_t>(i);
+        }
+    }
+    if (best >= 0) {
+        g_actor_prev[best].claimed = true;
+        inst.id = g_actor_prev[best].id;
+    }
+    else {
+        g_actor_next_id = (g_actor_next_id + 1U) % kActorIdCount;
+        inst.id = kActorTransformIdBase + g_actor_next_id * kActorTransformIdStride;
+    }
+    g_actor_cur[g_actor_cur_count++] = inst;
+    return inst.id;
+}
+
 // Set for the duration of func_800BFD6C, Tooie's sky draw. That function has a
 // single exit (`L_800BFEF8`), reached both by its early-out and by the normal
 // path, so the flag is set on entry and cleared there without needing a
@@ -1444,6 +1560,7 @@ extern "C" void tooie_rt64_begin_frame(uint8_t* rdram, recomp_context* ctx) {
     }
     g_player_scope_depth = 0;
     g_player_key = 0;
+    actor_begin_frame();
 
     if (!append_command(rdram, kRenderBufferState, kEnableWord0,
                         kEnableWord1)) {
@@ -1509,7 +1626,8 @@ extern "C" void tooie_rt64_push_player_root(uint8_t* rdram,
 
     const bool in_player = g_player_scope_depth != 0U;
     const bool in_sky = g_sky_draw_depth != 0U;
-    if (!in_player && !in_sky) {
+    const bool in_actor = !in_player && !in_sky && !rt64_actors_off();
+    if (!in_player && !in_sky && !in_actor) {
         return;
     }
 
@@ -1548,7 +1666,9 @@ extern "C" void tooie_rt64_push_player_root(uint8_t* rdram,
         return;
     }
 
-    scope.transform_id = player_model_transform_id(g_player_key, model);
+    scope.transform_id = in_actor
+        ? actor_transform_id(rdram, cursor, model)
+        : player_model_transform_id(g_player_key, model);
     if (scope.transform_id == 0U) {
         return;
     }
@@ -1598,7 +1718,7 @@ extern "C" void tooie_rt64_push_player_bone(uint8_t* rdram,
     if (rt64_disabled()) {
         return;
     }
-    if (g_player_scope_depth == 0U || g_root_scope_depth == 0U) {
+    if (g_root_scope_depth == 0U) {
         return;
     }
 
