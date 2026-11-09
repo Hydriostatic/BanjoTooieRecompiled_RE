@@ -1166,6 +1166,10 @@ int32_t read_half_signed(uint8_t* rdram, uint32_t address) {
 struct RootScope {
     uint32_t transform_id;
     bool pushed;
+    // How many times each bone index has been tagged under this root. A bone
+    // index that repeats (one bone driving two parts) would otherwise give two
+    // matrices the same id, and RT64 blends one into the other.
+    uint8_t bone_uses[128];
 };
 
 // ---- Every other model (enemies, NPCs, objects) --------------------------
@@ -1210,6 +1214,18 @@ thread_local uint32_t g_player_scope_depth = 0;
 thread_local uint32_t g_player_key = 0;
 thread_local PlayerModelKey g_player_models[kPlayerModelCount] = {};
 thread_local uint32_t g_player_model_count = 0;
+// Tooie can draw the same player model more than once in a frame (the extra
+// passes that do not go through a different model). Each pass needs its own id,
+// or RT64 sees one id twice and blends the two passes into each other, which
+// shears Banjo while he moves. Passes are numbered in draw order, which is the
+// same from frame to frame.
+struct PlayerModelUse {
+    uint32_t player;
+    uint32_t model;
+    uint32_t count;
+};
+thread_local PlayerModelUse g_player_uses[64] = {};
+thread_local uint32_t g_player_use_count = 0;
 thread_local RootScope g_root_scopes[kRootScopeCount] = {};
 thread_local uint32_t g_root_scope_depth = 0;
 thread_local bool g_bone_scopes[kBoneScopeCount] = {};
@@ -1228,6 +1244,18 @@ uint32_t stable_player_key(uint8_t* rdram, uint32_t player_state) {
     // Its address is still stable across adjacent frames, so fold it into the
     // same range rather than blending it with a known slot.
     return kPlayerStateSlotCount + 1U + ((player_state >> 4U) % 240U);
+}
+
+uint32_t player_model_pass(uint32_t player, uint32_t model) {
+    for (uint32_t i = 0; i < g_player_use_count; ++i) {
+        if (g_player_uses[i].player == player && g_player_uses[i].model == model) {
+            return g_player_uses[i].count++;
+        }
+    }
+    if (g_player_use_count < 64U) {
+        g_player_uses[g_player_use_count++] = {player, model, 1U};
+    }
+    return 0;
 }
 
 uint32_t player_model_transform_id(uint32_t player, uint32_t model) {
@@ -1561,6 +1589,7 @@ extern "C" void tooie_rt64_begin_frame(uint8_t* rdram, recomp_context* ctx) {
     g_player_scope_depth = 0;
     g_player_key = 0;
     actor_begin_frame();
+    g_player_use_count = 0;
 
     if (!append_command(rdram, kRenderBufferState, kEnableWord0,
                         kEnableWord1)) {
@@ -1668,7 +1697,8 @@ extern "C" void tooie_rt64_push_player_root(uint8_t* rdram,
 
     scope.transform_id = in_actor
         ? actor_transform_id(rdram, cursor, model)
-        : player_model_transform_id(g_player_key, model);
+        : player_model_transform_id(
+              g_player_key | (player_model_pass(g_player_key, model) << 16), model);
     if (scope.transform_id == 0U) {
         return;
     }
@@ -1744,15 +1774,22 @@ extern "C" void tooie_rt64_push_player_bone(uint8_t* rdram,
     }
 
     const int32_t bone = static_cast<int32_t>(MEM_B(9, ctx->r7));
-    if (bone < 0 || bone >= static_cast<int32_t>(kPlayerTransformIdStride - 1U)) {
+    if (bone < 0 || bone >= 127) {
         return;
     }
+    // First use of a bone: 1 + bone. A repeat use gets its own id in the upper
+    // half of the model's id range instead of sharing the first one's.
+    const uint32_t use = root_scope.bone_uses[bone]++;
+    if (use > 1U) {
+        return;
+    }
+    const uint32_t bone_slot = static_cast<uint32_t>(bone) + use * 127U;
 
     // func_800DCF48 keeps the graphics buffers in s0, and its bone pop runs
     // before s0 is restored, so the same register is valid at both sites.
     const uint32_t cursor = static_cast<uint32_t>(ctx->r16);
     g_bone_scopes[depth] = append_matrix_group(
-        rdram, cursor, root_scope.transform_id + 1U + static_cast<uint32_t>(bone),
+        rdram, cursor, root_scope.transform_id + 1U + bone_slot,
         kBoneGroupFlags);
     if (g_bone_scopes[depth]) {
         ++g_frame_bone_groups;
