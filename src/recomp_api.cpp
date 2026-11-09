@@ -989,6 +989,25 @@ constexpr uint32_t kRootGroupFlags = matrix_group_flags(
     G_EX_COMPONENT_INTERPOLATE, G_EX_COMPONENT_SKIP,
     G_EX_COMPONENT_INTERPOLATE, G_EX_ORDER_LINEAR,
     G_EX_ASPECT_AUTO, G_EX_COMPONENT_INTERPOLATE, G_EX_COMPONENT_AUTO);
+// The player's close-up (high-detail) model is skinned on the CPU: its vertices
+// are rewritten every game frame. With vertex interpolation skipped, those
+// vertices jump at the game's own rate while the bone matrices around them are
+// blended, which tears the mesh above 30 fps. The player's groups therefore
+// interpolate vertices as well (static vertices are unaffected).
+constexpr uint32_t kPlayerRootGroupFlags = matrix_group_flags(
+    1U, 0U, G_EX_INTERPOLATE_DECOMPOSE,
+    G_EX_COMPONENT_INTERPOLATE, G_EX_COMPONENT_INTERPOLATE,
+    G_EX_COMPONENT_INTERPOLATE, G_EX_COMPONENT_INTERPOLATE,
+    G_EX_COMPONENT_INTERPOLATE, G_EX_COMPONENT_INTERPOLATE,
+    G_EX_COMPONENT_INTERPOLATE, G_EX_ORDER_LINEAR,
+    G_EX_ASPECT_AUTO, G_EX_COMPONENT_INTERPOLATE, G_EX_COMPONENT_AUTO);
+constexpr uint32_t kPlayerBoneGroupFlags = matrix_group_flags(
+    1U, 0U, G_EX_INTERPOLATE_DECOMPOSE,
+    G_EX_COMPONENT_INTERPOLATE, G_EX_COMPONENT_INTERPOLATE,
+    G_EX_COMPONENT_INTERPOLATE, G_EX_COMPONENT_INTERPOLATE,
+    G_EX_COMPONENT_INTERPOLATE, G_EX_COMPONENT_INTERPOLATE,
+    G_EX_COMPONENT_INTERPOLATE, G_EX_ORDER_LINEAR,
+    G_EX_ASPECT_AUTO, G_EX_COMPONENT_SKIP, G_EX_COMPONENT_AUTO);
 // The bones differ from the root only in texcoords, which the player's geometry
 // does not animate.
 constexpr uint32_t kBoneGroupFlags = matrix_group_flags(
@@ -1703,8 +1722,9 @@ extern "C" void tooie_rt64_push_player_root(uint8_t* rdram,
         return;
     }
 
-    scope.pushed =
-        append_matrix_group(rdram, cursor, scope.transform_id, kRootGroupFlags);
+    scope.pushed = append_matrix_group(
+        rdram, cursor, scope.transform_id,
+        in_actor ? kRootGroupFlags : kPlayerRootGroupFlags);
     if (scope.pushed) {
         ++g_frame_root_groups;
     }
@@ -1790,7 +1810,7 @@ extern "C" void tooie_rt64_push_player_bone(uint8_t* rdram,
     const uint32_t cursor = static_cast<uint32_t>(ctx->r16);
     g_bone_scopes[depth] = append_matrix_group(
         rdram, cursor, root_scope.transform_id + 1U + bone_slot,
-        kBoneGroupFlags);
+        g_player_scope_depth != 0U ? kPlayerBoneGroupFlags : kBoneGroupFlags);
     if (g_bone_scopes[depth]) {
         ++g_frame_bone_groups;
     }
